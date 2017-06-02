@@ -59,8 +59,11 @@ public class MainActivity extends AppCompatActivity
         navigationView.setNavigationItemSelectedListener(this);
 
         navigationView.setCheckedItem(R.id.nav_outline);
-        Fragment fragment = new OutlineFragment();
-        getFragmentManager().beginTransaction().replace(R.id.content_main, fragment, FRAGMENT_OUTLINE).commit();
+        
+        if(savedInstanceState != null){
+          Fragment fragment = new OutlineFragment();
+          getFragmentManager().beginTransaction().replace(R.id.content_main, fragment, FRAGMENT_OUTLINE).commit();
+        }
 
         EHService.start(this);
     }
