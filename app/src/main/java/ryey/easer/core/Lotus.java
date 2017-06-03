@@ -28,6 +28,9 @@ import android.net.Uri;
 import android.os.PatternMatcher;
 import android.util.Log;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import ryey.easer.commons.plugindef.eventplugin.AbstractSlot;
 import ryey.easer.commons.plugindef.eventplugin.EventData;
 import ryey.easer.commons.plugindef.eventplugin.EventPlugin;
@@ -41,27 +44,32 @@ import ryey.easer.plugins.PluginRegistry;
  * When the root is satisfied, Lotus will recursively check all children to find which is satisfied.
  * After finding a satisfied child and the child has a Profile, Lotus will load the Profile.
  *
- * Currently, Lotus uses *post* order traversal to find the *first* satisfied child with Profile.
+ * See onSlotSatisfied() for the actual way to check and determine which is satisfied.
  */
 final class Lotus {
     private static final String ACTION_SLOT_SATISFIED = "ryey.easer.triggerlotus.action.SLOT_SATISFIED";
+    private static final String ACTION_SLOT_UNSATISFIED = "ryey.easer.triggerlotus.action.SLOT_UNSATISFIED";
     private static final String CATEGORY_NOTIFY_LOTUS = "ryey.easer.triggerlotus.category.NOTIFY_LOTUS";
 
     private Context context;
     private final EventTree eventTree;
 
     private final Uri uri = Uri.parse(String.format("lotus://%d", hashCode()));
-    private final PendingIntent notifyLotusIntent;
+    private final PendingIntent notifyLotusIntent, notifyLotusUnsatisfiedIntent;
 
     private AbstractSlot mSlot;
+    private List<Lotus> subs = new ArrayList<>();
 
     private boolean analyzing = false;
 
     private BroadcastReceiver mReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (intent.getAction().equals(ACTION_SLOT_SATISFIED))
+            if (intent.getAction().equals(ACTION_SLOT_SATISFIED)) {
                 onSlotSatisfied();
+            } else if (intent.getAction().equals(ACTION_SLOT_UNSATISFIED)) {
+                onSlotUnsatisfied();
+            }
         }
     };
 
@@ -73,6 +81,8 @@ final class Lotus {
         intent1.addCategory(CATEGORY_NOTIFY_LOTUS);
         intent1.setData(uri);
         notifyLotusIntent = PendingIntent.getBroadcast(context, 0, intent1, 0);
+        intent1.setAction(ACTION_SLOT_UNSATISFIED);
+        notifyLotusUnsatisfiedIntent = PendingIntent.getBroadcast(context, 0, intent1, 0);
 
         IntentFilter filter = new IntentFilter();
         filter.addAction(ACTION_SLOT_SATISFIED);
@@ -83,7 +93,7 @@ final class Lotus {
         context.registerReceiver(mReceiver, filter);
 
         mSlot = dataToSlot(eventTree.getEvent());
-        mSlot.register(notifyLotusIntent);
+        mSlot.register(notifyLotusIntent, notifyLotusUnsatisfiedIntent);
     }
 
     private AbstractSlot dataToSlot(EventData data) {
@@ -95,27 +105,44 @@ final class Lotus {
     }
 
     void listen() {
+        mSlot.check();
         mSlot.listen();
     }
 
     void cancel() {
         mSlot.cancel();
+        for (Lotus sub : subs) {
+            sub.cancel();
+        }
+        subs.clear();
     }
 
     private synchronized void onSlotSatisfied() {
         Log.d(getClass().getSimpleName(), String.format("onSlotSatisfied %s", eventTree.getName()));
         if (!analyzing) {
             analyzing = true;
-            findLastAndTrigger(eventTree, false);
+            if (mSlot.canPromoteSub()) {
+                triggerAndPromote();
+            } else {
+                traverseAndTrigger(eventTree, false);
+            }
             analyzing = false;
         }
     }
 
+    private synchronized void onSlotUnsatisfied() {
+        Log.d(getClass().getSimpleName(), String.format("onSlotUnsatisfied %s", eventTree.getName()));
+        for (Lotus sub : subs) {
+            sub.cancel();
+        }
+        subs.clear();
+    }
+
     /*
-     * DFS尋找第一個滿足所有條件（通過@AbstractSlot.isSatisfied()）的節點
+     * 中序遍歷樹並尋找滿足條件（通過@AbstractSlot.isSatisfied()）的所有節點
      * 並在其處（所在的遞歸棧）載入對應Profile
      */
-    private boolean findLastAndTrigger(EventTree node, boolean is_sub) {
+    private void traverseAndTrigger(EventTree node, boolean is_sub) {
         EventData eventData = node.getEvent();
         AbstractSlot slot = mSlot;
         if (is_sub) {
@@ -123,26 +150,39 @@ final class Lotus {
             slot.check();
         }
         if (slot.isSatisfied()) {
-            boolean handled_by_sub = false;
-            for (EventTree sub : node.getSubs()) {
-                handled_by_sub = handled_by_sub || findLastAndTrigger(sub, true);
+            Log.d(getClass().getSimpleName(),
+                    String.format(" traversing and find %s satisfied", node.getName()));
+            String profileName = node.getProfile();
+            if (profileName != null) {
+                Intent intent = new Intent(context, ProfileLoaderIntentService.class);
+                intent.setAction(ProfileLoaderIntentService.ACTION_LOAD_PROFILE);
+                intent.putExtra(ProfileLoaderIntentService.EXTRA_PROFILE_NAME, profileName);
+                intent.putExtra(ProfileLoaderIntentService.EXTRA_EVENT_NAME, node.getName());
+                context.startService(intent);
             }
-            if (!handled_by_sub) {
-                Log.d(getClass().getSimpleName(), " got last satisfied");
-                String profileName = node.getProfile();
-                if (profileName != null) {
-                    Intent intent = new Intent(context, ProfileLoaderIntentService.class);
-                    intent.setAction(ProfileLoaderIntentService.ACTION_LOAD_PROFILE);
-                    intent.putExtra(ProfileLoaderIntentService.EXTRA_PROFILE_NAME, profileName);
-                    intent.putExtra(ProfileLoaderIntentService.EXTRA_EVENT_NAME, node.getName());
-                    context.startService(intent);
-                    return true;
-                } else
-                    return false;
-            } else {
-                return true;
+            for (EventTree sub : node.getSubs()) {
+                traverseAndTrigger(sub, true);
             }
         }
-        return false;
+    }
+
+    private void triggerAndPromote() {
+        if (mSlot.isSatisfied()) {
+            Log.d(getClass().getSimpleName(),
+                    String.format(" traversing and find %s satisfied", eventTree.getName()));
+            String profileName = eventTree.getProfile();
+            if (profileName != null) {
+                Intent intent = new Intent(context, ProfileLoaderIntentService.class);
+                intent.setAction(ProfileLoaderIntentService.ACTION_LOAD_PROFILE);
+                intent.putExtra(ProfileLoaderIntentService.EXTRA_PROFILE_NAME, profileName);
+                intent.putExtra(ProfileLoaderIntentService.EXTRA_EVENT_NAME, eventTree.getName());
+                context.startService(intent);
+            }
+            for (EventTree sub : eventTree.getSubs()) {
+                Lotus subLotus = new Lotus(context, sub);
+                subs.add(subLotus);
+                subLotus.listen();
+            }
+        }
     }
 }
